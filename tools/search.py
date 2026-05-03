@@ -2,7 +2,7 @@ from ddgs import DDGS
 from pydantic import BaseModel, Field
 import json
 from typing import Optional
-from langchain_core.tools import tool  # ← добавить в импорты
+from langchain_core.tools import tool
 
 class SearchInput(BaseModel):
     query: str = Field(description="Поисковый запрос на естественном языке")

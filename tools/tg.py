@@ -6,9 +6,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import Optional
 from langchain_core.tools import tool
-from dotenv import load_dotenv  # ← добавили
+from dotenv import load_dotenv
 
-# 🔹 Явно загружаем .env (если ещё не загружен в main)
 load_dotenv()
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
@@ -24,7 +23,6 @@ class SendMessageInput(BaseModel):
 def send_telegram_tool(chat_id: int | str, text: str, parse_mode: Optional[str] = None) -> str:
     """Отправляет сообщение в Telegram. Перед первым использованием"""
     
-    # 🔹 Явная проверка токена
     if not TG_BOT_TOKEN or not TG_API_URL:
         return json.dumps({
             "error": "TG_BOT_TOKEN не настроен. Добавь в .env: TG_BOT_TOKEN=123456:ABC-DEF...",
@@ -40,15 +38,13 @@ def send_telegram_tool(chat_id: int | str, text: str, parse_mode: Optional[str] 
         payload["parse_mode"] = parse_mode.upper()
 
     try:
-        # 🔹 Telegram API лучше работает с form-data, а не JSON
         with httpx.Client() as client:
             response = client.post(
                 f"{TG_API_URL}/sendMessage",
-                data=payload,  # ← form-urlencoded (надёжнее, чем json=)
+                data=payload,
                 timeout=10.0
             )
             
-            # 🔹 Логирование для отладки (раскомментируй при проблемах)
             print(f"[TG DEBUG] Status: {response.status_code}, Body: {response.text}")
             
             response.raise_for_status()
