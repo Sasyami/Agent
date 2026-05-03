@@ -58,25 +58,11 @@ def build_system_prompt(long_term: str | None = None) -> str:
     
     memory = load_prompt("system_memory.txt")
     return f"{base}\n\n{memory.format(long_term=long_term)}"
-
-def call_model(state: AgentState, config: RunnableConfig) -> dict:  # ← фикс сигнатуры
-    session_id = config["configurable"]["thread_id"]
-    mem = LangChainMemory(session_id)
-
-    last_user = next(
-        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
-        "",
-    )
-    long_term = mem.search_long_term(last_user)
-    system_content = build_system_prompt(long_term)
-    
-    messages = [SystemMessage(content=system_content )] + [
-            m for m in state["messages"] if not isinstance(m, SystemMessage)
-        ]
-    
-
-    response = llm_with_tools.invoke(messages)
+def call_model(state: AgentState, config: RunnableConfig) -> dict:
+    """Чистый вызов LLM. Память и системный промпт уже в state["messages"]."""
+    response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
+
 
 
 def should_continue(state: AgentState) -> str:
@@ -100,28 +86,27 @@ app = workflow.compile(checkpointer=checkpointer)
 
 # agent.py (замени функцию run_agent на эту)
 
-def run_agent(user_query: str, session_id: str = "default") -> str:
-    config = {"configurable": {"thread_id": session_id}}
+def run_agent(user_query: str, session_id: str = "default", chat_id: int = -1) -> str:
+    config = {"configurable": {"thread_id": session_id, "chat_id": chat_id}}
     mem = LangChainMemory(session_id)
     
-    # 1. Ищем релевантную историю
+    # 1️⃣ Ищем релевантную долгосрочную историю (1 API-вызов на эмбеддинг)
     long_term = mem.search_long_term(user_query)
     
-    # 2. Формируем начальные сообщения
-    initial_messages = []
+    # 2️⃣ Собираем финальный системный промпт
+    system_content = build_system_prompt(long_term)
+    # Добавляем тех. инфу для тулзов (напоминания, отправка в TG)
+    system_content += f"\n\nID текущего чата пользователя = `{chat_id}`. Используй его при создании напоминаний или отправке сообщений."
     
-    # Если есть долгосрочная память — добавляем как SystemMessage (не смешиваем с запросом!)
-    if long_term:
-        initial_messages.append(SystemMessage(content=f"🧠 КОНТЕКСТ ИЗ ПРОШЛЫХ ДИАЛОГОВ:\n{long_term}\n\nИспользуй эту информацию, если она релевантна."))
+    initial_messages = [
+        SystemMessage(content=system_content),
+        HumanMessage(content=user_query)
+    ]
     
-    # Добавляем сам запрос пользователя
-    initial_messages.append(HumanMessage(content=user_query))
-    
-    # 3. Запускаем граф
+    # 3️⃣ Запускаем граф
     result = app.invoke({"messages": initial_messages}, config=config)
     
-    # 4. Сохраняем НОВЫЕ сообщения в память (дельта)
-    # Берем срез от длины начальных сообщений до конца результата
+    # 4️⃣ Сохраняем ТОЛЬКО новые сообщения в долгосрочную память (дельта)
     new_msgs = result["messages"][len(initial_messages):]
     if new_msgs:
         mem.add_messages(new_msgs)
