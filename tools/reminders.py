@@ -1,4 +1,3 @@
-# tools/reminders.py
 import json
 import time
 from datetime import datetime, timezone
