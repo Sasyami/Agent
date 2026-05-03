@@ -1,108 +1,156 @@
 import os
-import json
 import time
+import uuid
+import json
+import shutil
 import sqlite3
 import faiss
-import numpy as np
 from pathlib import Path
-from typing import List
-from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Union
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.vectorstores import BaseDocStore
 
 MEMORY_DIR = Path("chat_memory")
 MEMORY_DIR.mkdir(exist_ok=True)
-SQLITE_LIMIT = 50
-FAISS_TOP_K = 3
-MIGRATION_BATCH = 5
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+RECENT_LIMIT = 50
+LONG_TERM_TOP_K = 3
 
-def _to_text(msg: BaseMessage) -> str:
-    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-    return f"[{msg.type}] {content}" if len(content.strip()) > 10 else ""
+# 🔹 Встроенный докстор на SQLite (хранит тексты на диске, 0 RAM)
+class SQLiteDocstore(BaseDocStore):
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, content TEXT, metadata TEXT)")
+            conn.commit()
 
-class Memory:
+    def add(self, texts: Dict[str, Document]) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO docs (id, content, metadata) VALUES (?, ?, ?)",
+                [(id_, doc.page_content, json.dumps(doc.metadata, ensure_ascii=False, default=str)) for id_, doc in texts.items()]
+            )
+            conn.commit()
+
+    def search(self, search_id: str) -> Union[Document, str]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute("SELECT content, metadata FROM docs WHERE id = ?", (search_id,)).fetchone()
+        if row is None:
+            return f"ID {search_id} not found"
+        return Document(page_content=row[0], metadata=json.loads(row[1]))
+
+    def search_batch(self, search_ids: List[str]) -> Dict[str, Union[Document, str]]:
+        return {sid: self.search(sid) for sid in search_ids}
+
+
+class LangChainMemory:
     def __init__(self, session_id: str = "default"):
         self.session_id = session_id
-        self.db_path = MEMORY_DIR / f"{session_id}.db"
-        self.faiss_idx_path = MEMORY_DIR / f"{session_id}.faiss"
-        self.faiss_meta_path = MEMORY_DIR / f"{session_id}_meta.jsonl"
-        self.embedder = SentenceTransformer(EMBEDDING_MODEL)
-        self.index = faiss.IndexFlatL2(384)
-        self.metadata: List[dict] = []
-        self._init_db()
-        self._load_faiss()
+        self.storage_path = MEMORY_DIR / session_id
+        self.storage_path.mkdir(parents=True, exist_ok=True)
 
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT, content TEXT, tool_call_id TEXT, tool_calls TEXT, timestamp REAL
-        )""")
-        conn.commit(); conn.close()
+        self.index_path = self.storage_path / "index.faiss"
+        self.id_map_path = self.storage_path / "index_to_docstore_id.json"
+        self.docstore_path = self.storage_path / "docstore.db"
 
-    def _load_faiss(self):
-        if self.faiss_idx_path.exists() and self.faiss_meta_path.exists():
-            self.index = faiss.read_index(str(self.faiss_idx_path))
-            with open(self.faiss_meta_path, "r", encoding="utf-8") as f:
-                self.metadata = [json.loads(line) for line in f]
+        self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        self.dimension = self.embeddings.client.get_sentence_embedding_dimension() or 384
 
-    def _save_faiss(self):
-        faiss.write_index(self.index, str(self.faiss_idx_path))
-        with open(self.faiss_meta_path, "w", encoding="utf-8") as f:
-            for item in self.metadata:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        # Инициализируем дисковый докстор
+        self.docstore = SQLiteDocstore(self.docstore_path)
+        self._id_timeline: List[str] = []
+
+        self._init_store()
+
+    def _init_store(self):
+        timeline_path = self.storage_path / "timeline.json"
+        if timeline_path.exists():
+            self._id_timeline = json.loads(timeline_path.read_text())
+
+        # Загружаем или создаём FAISS-индекс и маппинг ID вручную (чтобы обойти InMemoryDocstore)
+        if self.index_path.exists() and self.id_map_path.exists():
+            self.index = faiss.read_index(str(self.index_path))
+            with open(self.id_map_path, "r", encoding="utf-8") as f:
+                self.index_to_docstore_id = json.load(f)
+        else:
+            self.index = faiss.IndexFlatL2(self.dimension)
+            self.index_to_docstore_id = {}
+
+        # Собираем векторстор с нашим SQLite-докстором
+        self.vectorstore = FAISS(
+            embedding_function=self.embeddings,
+            index=self.index,
+            docstore=self.docstore,
+            index_to_docstore_id=self.index_to_docstore_id
+        )
+
+    def _save(self):
+        faiss.write_index(self.index, str(self.index_path))
+        with open(self.id_map_path, "w", encoding="utf-8") as f:
+            json.dump(self.vectorstore.index_to_docstore_id, f)
+        timeline_path = self.storage_path / "timeline.json"
+        timeline_path.write_text(json.dumps(self._id_timeline))
+        # SQLiteDocstore сохраняет данные сам внутри .add(), тут сохранять не нужно
 
     def add_messages(self, messages: List[BaseMessage]):
-        conn = sqlite3.connect(self.db_path)
+        docs = []
+        new_ids = []
         for msg in messages:
             if isinstance(msg, SystemMessage): continue
-            conn.execute("""INSERT INTO messages (type, content, tool_call_id, tool_calls, timestamp)
-                            VALUES (?, ?, ?, ?, ?)""",
-                         (msg.type, msg.content, 
-                          msg.tool_call_id if hasattr(msg, 'tool_call_id') else None,
-                          json.dumps(msg.tool_calls) if hasattr(msg, 'tool_calls') and msg.tool_calls else None,
-                          time.time()))
-        conn.commit()
-        count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        if count > SQLITE_LIMIT:
-            self._migrate_oldest(conn)
-        conn.close()
+            doc_id = str(uuid.uuid4())
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if len(content.strip()) < 5: continue
 
-    def _migrate_oldest(self, conn):
-        rows = conn.execute("""SELECT id, type, content, timestamp FROM messages
-                               ORDER BY timestamp ASC LIMIT ?""", (MIGRATION_BATCH,)).fetchall()
-        for msg_id, mtype, content, ts in rows:
-            if content and mtype in ("human", "ai"):
-                vec = self.embedder.encode([f"[{mtype}] {content}"], show_progress_bar=False)
-                self.index.add(vec)
-                self.metadata.append({"id": msg_id, "type": mtype, "content": content, "timestamp": ts})
-            conn.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
-        conn.commit()
-        self._save_faiss()
+            docs.append(Document(
+                page_content=content,
+                metadata={
+                    "role": msg.type,
+                    "timestamp": time.time(),
+                    "id": doc_id,
+                    "tool_call_id": getattr(msg, "tool_call_id", None),
+                    "tool_calls": getattr(msg, "tool_calls", None)
+                }
+            ))
+            new_ids.append(doc_id)
+            self._id_timeline.append(doc_id)
 
-    def load_short_term(self) -> List[BaseMessage]:
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("""SELECT type, content, tool_call_id, tool_calls FROM messages
-                               ORDER BY timestamp ASC""").fetchall()
+        if docs:
+            self.vectorstore.add_documents(docs, ids=new_ids)
+            if len(self._id_timeline) > 1000:
+                self._id_timeline = self._id_timeline[-1000:]
+            self._save()
+
+    def get_recent(self, n: int = RECENT_LIMIT) -> List[BaseMessage]:
+        """Возвращает последние N сообщений напрямую из FAISS docstore."""
+        recent_ids = self._id_timeline[-n:]
         msgs = []
-        for t, c, tc_id, tc_json in rows:
-            if t == "human": msgs.append(HumanMessage(content=c))
-            elif t == "ai": 
-                tc = json.loads(tc_json) if tc_json else None
-                msgs.append(AIMessage(content=c, tool_calls=tc))
-            elif t == "tool": msgs.append(ToolMessage(content=c, tool_call_id=tc_id))
-        conn.close()
+        for doc_id in recent_ids:
+            doc = self.vectorstore.docstore.search(doc_id)
+            if isinstance(doc, Document):
+                msgs.append(self._doc_to_msg(doc))
         return msgs
 
-    def search_long_term(self, query: str) -> str:
-        if self.index.ntotal == 0: return ""
-        vec = self.embedder.encode([query], show_progress_bar=False)
-        _, indices = self.index.search(vec, min(FAISS_TOP_K, self.index.ntotal))
-        res = [f"- [{self.metadata[i]['type']}] {self.metadata[i]['content']}" for i in indices[0] if i < len(self.metadata)]
-        return "\n🧠 ДОЛГОСРОЧНАЯ ПАМЯТЬ:\n" + "\n".join(res) if res else ""
+    def search_long_term(self, query: str, k: int = LONG_TERM_TOP_K) -> str:
+        """Семантический поиск по всей истории."""
+        if self.vectorstore.index.ntotal == 0: return ""
+        docs = self.vectorstore.similarity_search(query, k=k)
+        if not docs: return ""
+        res = [f"- [{d.metadata['role']}] {d.page_content}" for d in docs]
+        return "\n🧠 ДОЛГОСРОЧНАЯ ПАМЯТЬ:\n" + "\n".join(res)
+
+    def _doc_to_msg(self, doc: Document) -> BaseMessage:
+        role = doc.metadata.get("role")
+        content = doc.page_content
+        if role == "human": return HumanMessage(content=content)
+        if role == "ai": return AIMessage(content=content, tool_calls=doc.metadata.get("tool_calls"))
+        if role == "tool": return ToolMessage(content=content, tool_call_id=doc.metadata.get("tool_call_id"))
+        return HumanMessage(content=content)
 
     def clear(self):
-        for p in [self.db_path, self.faiss_idx_path, self.faiss_meta_path]:
-            if p.exists(): p.unlink()
-        self.index = faiss.IndexFlatL2(384)
-        self.metadata = []
+        if self.storage_path.exists():
+            shutil.rmtree(self.storage_path)
+        self._init_store()
+        self._id_timeline = []

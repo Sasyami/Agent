@@ -1,6 +1,7 @@
 import os
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -27,6 +28,10 @@ class AddEventInput(BaseModel):
 
 class ListEventsInput(BaseModel):
     limit: int = Field(default=5, ge=1, le=20, description="Макс. кол-во событий для вывода")
+class ParseRelativeDateInput(BaseModel):
+    relative: str = Field(description="Относительная дата: 'завтра', 'через 3 дня', 'в понедельник', 'на следующей неделе'")
+    base_date: Optional[str] = Field(default=None, description="Базовая дата в формате YYYY-MM-DD (по умолчанию — сегодня)")
+    time: Optional[str] = Field(default=None, description="Время в формате HH:MM (опционально, добавляется к результату)")
 
 def _get_calendar_service():
     """Инициализирует Google Calendar API с кэшированием токена."""
@@ -49,6 +54,144 @@ def _get_calendar_service():
             f.write(creds.to_json())
             
     return build("calendar", "v3", credentials=creds)
+@tool
+def get_current_datetime_tool() -> str:
+    """Возвращает текущую дату и время. Используй, когда пользователь говорит 'сегодня', 'завтра', 'через час' и т.п. Формат: YYYY-MM-DD HH:MM (часовой пояс: {TIMEZONE})."""
+    try:
+        now = datetime.now()
+        return json.dumps({
+            "current_datetime": now.strftime("%Y-%m-%d %H:%M"),
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M"),
+            "weekday": now.strftime("%A"),
+            "timezone": TIMEZONE
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"Ошибка получения времени: {str(e)}"}, ensure_ascii=False)
+@tool
+def parse_relative_date_tool(relative: str, base_date: Optional[str] = None, time: Optional[str] = None) -> str:
+    """Парсит относительные даты на русском. 
+    Поддерживает: 'сегодня', 'завтра', 'вчера', 'через N дней/недель/месяцев', 'назад', 'в понедельник/вторник/...', 
+    'на этой/следующей/прошлой неделе', 'в начале/конце месяца'. 
+    Возвращает дату в формате YYYY-MM-DD или YYYY-MM-DD HH:MM (если указано время)."""
+    try:
+        # Базовая дата
+        if base_date:
+            base = datetime.strptime(base_date, "%Y-%m-%d")
+        else:
+            base = datetime.now()
+        
+        relative = relative.strip().lower()
+        result_date = base
+
+        # 📅 Простые случаи
+        if relative in ("сегодня", "сейчас", "текущий день"):
+            pass
+        elif relative in ("завтра", "следующий день"):
+            result_date = base + timedelta(days=1)
+        elif relative in ("послезавтра"):
+            result_date = base + timedelta(days=2)
+        elif relative in ("вчера", "предыдущий день"):
+            result_date = base - timedelta(days=1)
+        elif relative in ("позавчера"):
+            result_date = base - timedelta(days=2)
+
+        # 🔢 "через N дней/недель/месяцев/лет"
+        elif match := re.match(r"через\s+(\d+)\s+(дн[еяй]|день|дня|недел[юи]|недель|мес[яи]ц[ае]?|месяц[ае]?|лет|год[аи]?|года?)", relative):
+            n = int(match.group(1))
+            unit = match.group(2)
+            if "недел" in unit:
+                result_date = base + timedelta(weeks=n)
+            elif "мес" in unit:
+                # Прибавляем месяцы с учётом переполнения
+                month = base.month + n
+                year = base.year + (month - 1) // 12
+                month = (month - 1) % 12 + 1
+                day = min(base.day, [31,29 if year%4==0 and (year%100!=0 or year%400==0) else 28,31,30,31,30,31,31,30,31,30,31][month-1])
+                result_date = base.replace(year=year, month=month, day=day)
+            elif "лет" in unit or "год" in unit:
+                try:
+                    result_date = base.replace(year=base.year + n)
+                except ValueError:  # 29 Feb → non-leap year
+                    result_date = base.replace(year=base.year + n, day=28)
+            else:  # дни по умолчанию
+                result_date = base + timedelta(days=n)
+
+        # 🔙 "N дней назад", "неделю назад"
+        elif match := re.match(r"(\d+)?\s*(дн[еяй]?|день|дня|недел[юи]|недель|мес[яи]ц[ае]?|месяц[ае]?|лет|год[аи]?|года?)\s*назад", relative):
+            n = int(match.group(1)) if match.group(1) else 1
+            unit = match.group(2)
+            if "недел" in unit:
+                result_date = base - timedelta(weeks=n)
+            elif "мес" in unit:
+                month = base.month - n
+                year = base.year - (1 - month) // 12
+                month = (month - 1) % 12 + 1
+                day = min(base.day, [31,29 if year%4==0 and (year%100!=0 or year%400==0) else 28,31,30,31,30,31,31,30,31,30,31][month-1])
+                result_date = base.replace(year=year, month=month, day=day)
+            elif "лет" in unit or "год" in unit:
+                try:
+                    result_date = base.replace(year=base.year - n)
+                except ValueError:
+                    result_date = base.replace(year=base.year - n, day=28)
+            else:
+                result_date = base - timedelta(days=n)
+
+        # 🗓 "в понедельник", "в следующий вторник" и т.д.
+        elif match := re.match(r"(в\s+)?(следующ[ийую]|прошл[ыйую]|этой|на этой|на следующей|на прошлой)?\s*(понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея])", relative):
+            weekday_map = {"понедельник": 0, "вторник": 1, "среда": 2, "среду": 2, "четверг": 3, "пятница": 4, "пятницу": 4, "суббота": 5, "субботу": 5, "воскресенье": 6, "воскресенье": 6}
+            target_wd = weekday_map.get(match.group(3), 0)
+            modifier = match.group(2)
+            current_wd = base.weekday()
+            
+            if modifier in ("прошл", "на прошлой"):
+                days_diff = (target_wd - current_wd - 7) % 7 - 7
+            elif modifier in ("следующ", "на следующей"):
+                days_diff = (target_wd - current_wd + 7) % 7
+                if days_diff == 0:
+                    days_diff = 7
+            else:  # "в понедельник", "этой неделе"
+                days_diff = (target_wd - current_wd + 7) % 7
+            result_date = base + timedelta(days=days_diff)
+
+        # 📆 "на этой/следующей/прошлой неделе"
+        elif "неделе" in relative:
+            if "прошл" in relative:
+                result_date = base - timedelta(weeks=1)
+            elif "следующ" in relative:
+                result_date = base + timedelta(weeks=1)
+            # "на этой неделе" → оставляем base
+
+        # 🌙 "в начале/конце месяца"
+        elif "начале месяца" in relative:
+            result_date = base.replace(day=1)
+        elif "конце месяца" in relative:
+            # Последний день месяца
+            if base.month == 12:
+                result_date = base.replace(year=base.year+1, month=1, day=1) - timedelta(days=1)
+            else:
+                result_date = base.replace(month=base.month+1, day=1) - timedelta(days=1)
+
+        # ❓ Нераспознано → пробуем парсить как абсолютную дату
+        else:
+            try:
+                result_date = datetime.strptime(relative, "%Y-%m-%d")
+            except ValueError:
+                return json.dumps({"error": f"Не удалось распарсить дату: '{relative}'. Поддерживаемые форматы: 'завтра', 'через 3 дня', 'в понедельник', 'на следующей неделе'"}, ensure_ascii=False)
+
+        # Добавляем время, если указано
+        if time:
+            try:
+                t = datetime.strptime(time, "%H:%M")
+                result_date = result_date.replace(hour=t.hour, minute=t.minute)
+                return json.dumps({"date": result_date.strftime("%Y-%m-%d %H:%M"), "date_only": result_date.strftime("%Y-%m-%d"), "time": result_date.strftime("%H:%M")}, ensure_ascii=False)
+            except ValueError:
+                pass  # Игнорируем неверный формат времени
+
+        return json.dumps({"date": result_date.strftime("%Y-%m-%d"), "date_only": result_date.strftime("%Y-%m-%d")}, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({"error": f"Ошибка парсинга даты: {str(e)}"}, ensure_ascii=False)
 @tool
 def add_event_tool(summary: str, start: str, end: str, description: Optional[str] = None) -> str:
     """Добавляет событие в Google Calendar (primary календарь пользователя)."""
