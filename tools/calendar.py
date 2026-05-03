@@ -218,6 +218,106 @@ def add_event_tool(summary: str, start: str, end: str, description: Optional[str
     except Exception as e:
         return json.dumps({"error": f"Google Calendar ошибка: {str(e)}"}, ensure_ascii=False)
 @tool
+def delete_event_tool(
+    summary: str, 
+    start: str, 
+    end: str, 
+    description: Optional[str] = None,
+    exact_match: bool = False  # Новый параметр: строгое совпадение названия
+) -> str:
+    """Удаляет событие из Google Calendar по названию и временному окну.
+    
+    Args:
+        summary: Название события (поиск по подстроке, если exact_match=False)
+        start: Начало временного окна для поиска в формате YYYY-MM-DD HH:MM
+        end: Конец временного окна для поиска в формате YYYY-MM-DD HH:MM
+        description: Дополнительный фильтр по описанию (опционально)
+        exact_match: Если True — удалять только при точном совпадении названия
+    
+    Returns:
+        JSON со статусом операции и данными удалённого события
+    """
+    try:
+        service = _get_calendar_service()
+        
+        # Парсим временное окно для поиска
+        dt_start = datetime.strptime(start, "%Y-%m-%d %H:%M")
+        dt_end = datetime.strptime(end, "%Y-%m-%d %H:%M")
+        
+        # 1️⃣ Ищем события в указанном окне
+        events_result = service.events().list(
+            calendarId="primary",
+            timeMin=dt_start.isoformat(),
+            timeMax=dt_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50  # Ограничиваем выборку для безопасности
+        ).execute()
+        
+        items = events_result.get("items", [])
+        if not items:
+            return json.dumps({
+                "error": f"В окне {start} — {end} не найдено ни одного события"
+            }, ensure_ascii=False)
+        
+        # 2️⃣ Фильтруем по названию (и опционально по описанию)
+        candidates = []
+        for event in items:
+            event_summary = event.get("summary", "")
+            event_desc = event.get("description", "")
+            
+            # Проверка названия
+            name_match = (event_summary == summary) if exact_match else (summary.lower() in event_summary.lower())
+            # Проверка описания (если указано)
+            desc_match = (description is None) or (description.lower() in (event_desc or "").lower())
+            
+            if name_match and desc_match:
+                candidates.append(event)
+        
+        if not candidates:
+            return json.dumps({
+                "error": f"Не найдено событий с названием '{summary}' в указанном окне. "
+                        f"Доступные события: {[e.get('summary') for e in items]}"
+            }, ensure_ascii=False)
+        
+        # 3️⃣ Если найдено несколько — удаляем первое (или можно вернуть ошибку)
+        if len(candidates) > 1:
+            return json.dumps({
+                "warning": f"Найдено {len(candidates)} подходящих событий. Удалено первое.",
+                "deleted": {
+                    "summary": candidates[0].get("summary"),
+                    "start": candidates[0]["start"].get("dateTime", candidates[0]["start"].get("date")),
+                    "id": candidates[0]["id"]
+                },
+                "others": [
+                    {"summary": e.get("summary"), "start": e["start"].get("dateTime", e["start"].get("date"))}
+                    for e in candidates[1:]
+                ]
+            }, ensure_ascii=False)
+        
+        # 4️⃣ Удаляем событие по ID
+        target = candidates[0]
+        service.events().delete(calendarId="primary", eventId=target["id"]).execute()
+        
+        return json.dumps({
+            "status": "ok",
+            "deleted": {
+                "summary": target.get("summary"),
+                "start": target["start"].get("dateTime", target["start"].get("date")),
+                "id": target["id"]
+            },
+            "message": f"Событие '{target.get('summary')}' успешно удалено"
+        }, ensure_ascii=False)
+        
+    except ValueError as e:
+        return json.dumps({
+            "error": f"Неверный формат даты. Ожидается YYYY-MM-DD HH:MM. {e}"
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "error": f"Google Calendar ошибка: {str(e)}"
+        }, ensure_ascii=False)
+@tool
 def list_events_tool(limit: int = 5) -> str:
     """Возвращает ближайшие события из Google Calendar."""
     try:
