@@ -19,6 +19,9 @@ from tools.calendar import (
     parse_relative_date_tool,
     get_current_datetime_tool,
 )
+from tools.reminders import create_reminder_tool
+from utils.reminders import start_reminder_checker
+from tools.weather import get_weather_tool
 from utils.memory import LangChainMemory
 from pathlib import Path
 load_dotenv()
@@ -31,6 +34,8 @@ TOOLS = [
     get_current_datetime_tool,
     list_events_tool,
     send_telegram_tool,
+    create_reminder_tool,
+    get_weather_tool
 ]
 
 llm = ChatOpenAI(

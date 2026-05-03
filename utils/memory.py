@@ -126,9 +126,7 @@ class LangChainMemory:
 
     def search_long_term(self, query: str, k: int = 3, threshold: float = 0.6) -> str:
         """Семантический поиск с фильтрацией релевантности."""
-        # 🔹 Шаг 1: быстрая проверка — стоит ли вообще искать?
-        if not self.is_relevant_query(query):
-            return ""
+        
         
         if self.vectorstore.index.ntotal == 0:
             return ""
@@ -141,7 +139,6 @@ class LangChainMemory:
         
         relevant = []
         for doc, l2_dist in docs_and_scores:
-            # Конвертация L2 → косинусное сходство (для нормализованных векторов OpenAI)
             cosine_sim = 1 - (l2_dist ** 2) / 2
             if cosine_sim >= threshold:
                 relevant.append(f"- [{doc.metadata.get('role', '?')}] {doc.page_content}")
