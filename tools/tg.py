@@ -1,4 +1,3 @@
-# tools/telegram.py
 import os
 import httpx
 import json

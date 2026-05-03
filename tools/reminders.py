@@ -27,3 +27,22 @@ def create_reminder_tool(chat_id: int, text: str, due_time: str) -> str:
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+    
+@tool
+def cancel_reminder_tool(chat_id: int, reminder_id: int) -> str:
+    """Отменяет активное напоминание по ID.
+    reminder_id: числовой ID напоминания (возвращается при создании).
+    chat_id: ID чата пользователя (для проверки прав)."""
+    try:
+        from utils.reminders import cancel_reminder
+        if cancel_reminder(reminder_id, chat_id):
+            return json.dumps({
+                "status": "ok",
+                "message": f"Напоминание #{reminder_id} отменено."
+            }, ensure_ascii=False)
+        else:
+            return json.dumps({
+                "error": f"Напоминание #{reminder_id} не найдено, уже отправлено или принадлежит другому чату."
+            }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)

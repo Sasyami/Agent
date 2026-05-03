@@ -78,3 +78,16 @@ async def start_reminder_checker(bot):
         except Exception as e:
             logger.error(f"Ошибка в проверщике: {e}")
         await asyncio.sleep(10)
+
+def cancel_reminder(rem_id: int, chat_id: int) -> bool:
+    """Отменяет напоминание. Возвращает True, если запись найдена и удалена."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT id FROM reminders WHERE id = ? AND chat_id = ? AND status = 'pending'",
+            (rem_id, chat_id)
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM reminders WHERE id = ?", (rem_id,))
+            conn.commit()
+            return True
+        return False

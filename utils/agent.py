@@ -1,4 +1,3 @@
-# agent.py
 import os
 from typing import Annotated, Sequence
 from typing_extensions import TypedDict
@@ -19,7 +18,7 @@ from tools.calendar import (
     parse_relative_date_tool,
     get_current_datetime_tool,
 )
-from tools.reminders import create_reminder_tool
+from tools.reminders import cancel_reminder_tool, create_reminder_tool
 from utils.reminders import start_reminder_checker
 from tools.weather import get_weather_tool
 from utils.memory import LangChainMemory
@@ -35,6 +34,7 @@ TOOLS = [
     list_events_tool,
     send_telegram_tool,
     create_reminder_tool,
+    cancel_reminder_tool,
     get_weather_tool
 ]
 
@@ -77,7 +77,6 @@ def should_continue(state: AgentState) -> str:
     return END
 
 
-# Сборка графа
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", ToolNode(TOOLS))
@@ -89,18 +88,14 @@ checkpointer = MemorySaver()
 app = workflow.compile(checkpointer=checkpointer)
 
 
-# agent.py (замени функцию run_agent на эту)
 
 def run_agent(user_query: str, session_id: str = "default", chat_id: int = -1) -> str:
     config = {"configurable": {"thread_id": session_id, "chat_id": chat_id}}
     mem = LangChainMemory(session_id)
     
-    # 1️⃣ Ищем релевантную долгосрочную историю (1 API-вызов на эмбеддинг)
     long_term = mem.search_long_term(user_query)
     
-    # 2️⃣ Собираем финальный системный промпт
     system_content = build_system_prompt(long_term)
-    # Добавляем тех. инфу для тулзов (напоминания, отправка в TG)
     system_content += f"\n\nID текущего чата пользователя = `{chat_id}`. Используй его при создании напоминаний или отправке сообщений."
     
     initial_messages = [
@@ -108,10 +103,8 @@ def run_agent(user_query: str, session_id: str = "default", chat_id: int = -1) -
         HumanMessage(content=user_query)
     ]
     
-    # 3️⃣ Запускаем граф
     result = app.invoke({"messages": initial_messages}, config=config)
     
-    # 4️⃣ Сохраняем ТОЛЬКО новые сообщения в долгосрочную память (дельта)
     new_msgs = result["messages"][len(initial_messages):]
     if new_msgs:
         mem.add_messages(new_msgs)

@@ -17,30 +17,28 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_user.id
     text = update.message.text
-    logger.info(f"👤 Пользователь {chat_id}: {text}")
+    logger.info(f"Пользователь {chat_id}: {text}")
     
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        # 🔹 Передаём chat_id в агента
         response = run_agent(text, session_id=str(chat_id), chat_id=chat_id)
         for chunk in [response[i:i+4000] for i in range(0, len(response), 4000)]:
             await update.message.reply_text(chunk)
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ Ошибка обработки. Попробуйте позже.")
+        await update.message.reply_text("Ошибка обработки. Попробуйте позже.")
 
 async def main():
     application = Application.builder().token(TG_BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
-    # 🔹 Запуск фоновой проверки напоминаний
     asyncio.create_task(start_reminder_checker(application.bot))
     
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
     
-    logger.info("🚀 Бот запущен. Жду сообщений...")
+    logger.info("Бот запущен. Жду сообщений...")
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:

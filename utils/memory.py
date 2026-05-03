@@ -1,4 +1,3 @@
-# utils/memory.py
 import os
 import json
 import time
@@ -115,7 +114,6 @@ class LangChainMemory:
             ))
         
         if docs:
-            # LangChain сам сгенерирует ID, обновит index_to_docstore_id и вызовет docstore.add()
             self.vectorstore.add_documents(docs)
             self._save()
 
@@ -124,14 +122,13 @@ class LangChainMemory:
         with open(self.id_map_path, "w", encoding="utf-8") as f:
             json.dump(self.vectorstore.index_to_docstore_id, f)
 
-    def search_long_term(self, query: str, k: int = 3, threshold: float = 0.6) -> str:
+    def search_long_term(self, query: str, k: int = 5, threshold: float = 0.6) -> str:
         """Семантический поиск с фильтрацией релевантности."""
         
         
         if self.vectorstore.index.ntotal == 0:
             return ""
         
-        # 🔹 Шаг 2: поиск + фильтрация по порогу
         docs_and_scores = self.vectorstore.similarity_search_with_score(query, k=k)
         
         if not docs_and_scores:
@@ -146,7 +143,7 @@ class LangChainMemory:
         if not relevant:
             return ""
         
-        return "\n🧠 ДОЛГОСРОЧНАЯ ПАМЯТЬ:\n" + "\n".join(relevant)
+        return "\nДОЛГОСРОЧНАЯ ПАМЯТЬ:\n" + "\n".join(relevant)
 
     def clear(self):
         if self.storage_path.exists():
